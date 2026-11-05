@@ -1,0 +1,476 @@
+// station.mn: HUM's controller. It decides what a model of a Torus Station
+// does with its flywheel and its battery, twenty times a second.
+//
+// It reads one line from the ear on stdin every 50 ms and writes one
+// decision line for each. The function `decide` makes the decision, and its
+// signature declares five restrictions that the compiler proves through
+// every function it calls: it allocates no memory (`!Alloc`), it never
+// reaches the network (`!Network`) or a file (`!Filesystem`), it calls
+// nothing outside the program at all (`!WASI`), and nothing in it can stop
+// the program with an error (`!Trap`). The decision commands the two
+// machines through the operations of the effect `Station`: it asks Spin or
+// Pulse for a power, and the machine answers with what it gives, a `SpinW`
+// or a `PulseW`, so neither machine can be told to exceed its rating. The
+// frequency the fast rules act on is a `GridMhz`, which must lie between 55
+// and 65 Hz. Each decision line also says in words why the Station did what
+// it did.
+//
+//   mentl run examples/grid/station.mn < samples/ear_event.ndjson
+//   mentl check examples/grid/station-leak.mn     the copy the compiler refuses
+//   mentl audit examples/grid/station.mn          what is proven and what is not
+//   mentl why examples/grid/station.mn decide     where each effect comes from
+//
+// The Station is a model built from Torus's published figures, and every
+// screen says so. Spin, the flywheel, gives 100 kW and stores 10 kWh, so it
+// empties in six minutes at full power. Pulse, the battery, gives 300 kW
+// and stores 1,200 kWh, four hours at full power. The building behind the
+// meter draws 300 kW in rush hours and 200 kW otherwise. Every number is an
+// integer in thousandths (millihertz, thousandths of a decibel,
+// milliwatt-hours), read straight from the line's text, so the decision
+// never rounds a floating-point number and never calls the one conversion
+// that can trap.
+//
+// The fast rules act on "hz_fast", the 100 ms reading. Within 36 mHz of
+// 60 Hz nothing happens. Beyond that, Spin pushes in proportion to the
+// deviation and reaches its full 100 kW at 200 mHz past the band. When the
+// frequency changes faster than 100 mHz per second, Spin goes to full power
+// against the change. It holds full power for at least 2 s and at most
+// 10 s, and lets go once the rate is under 50 mHz per second and the
+// deviation no longer calls for more than half of Spin's rating. The mode
+// reads EVENT while the fast rules act.
+//
+// The slow rules act on the hour. In the rush-hour window Pulse runs the
+// building at 300 kW, and the mode reads RUSH. In a clean hour outside the
+// window, Pulse charges at 150 kW up to 95 percent, but never while the fast
+// rules say the grid is short of power, since charging would add load to a
+// grid that is already falling. When nothing else is happening, Spin tops
+// itself up from Pulse at 20 kW.
+//
+// ISLAND means the hum was heard and then lost: for six lines in a row
+// (300 ms) there is no reading, or the level is 30 dB under its ten-second
+// average. Spin carries the building for the first two seconds, then Pulse
+// does. Two lines with the hum back within 10 dB of its average end it.
+//
+// Each `<~ delay(1)` line keeps one value from the previous tick, and
+// together they are the controller's memory. The machines' stored energy and
+// their last commands belong to the handler `station`, which `main` installs
+// once, so all of the Station's memory is allocated at start. Each tick
+// advances every line once, in the order written. Everything one reading
+// allocates, from the line's bytes to the decision's words, is reclaimed
+// when the arena around that reading exits, so the memory the program uses
+// does not grow with the hours it runs.
+import arena
+
+import dsp/signal
+
+import fs
+
+import io
+
+import strings
+
+// ─── The ranges each value must stay in ──────────────────────────────
+type GridMhz = Int where 55000 < self && self < 65000
+
+type SpinW = Int where -100000 <= self && self <= 100000
+
+type PulseW = Int where -300000 <= self && self <= 300000
+
+type Soc = Int where 0 <= self && self <= 1000
+
+type Mode = Grid | Event | Rush | Island
+
+// Why the Station did what it did. `reason_text` turns the kind into words
+// together with the number the reason quotes.
+type Reason
+  = Listening
+  | Steady
+  | Pushing
+  | Falling
+  | Rising
+  | Holding
+  | RushHour
+  | Charging
+  | TopUp
+  | SpinEmpty
+  | Islanded
+  | HumGone
+
+// ─── The Station's operations ────────────────────────────────────────
+//
+// The decision commands the machines and explains itself through these
+// operations. `spin` and `pulse` ask a machine for a power, positive to
+// discharge into the building and negative to charge, and the machine
+// answers with what it gives: nothing when it is empty or full, and never
+// more than its rating. `because` records the reason for the tick, and
+// `report` writes the decision line. The handler `station` answers them all.
+effect Station {
+  spin(ask: Int) -> SpinW
+  pulse(ask: Int) -> PulseW
+  because(why: Reason, number: Int)
+  report(stamp: String, mode: Mode)
+}
+
+fn clamp_spin(raw) -> SpinW with Pure =
+  if raw > 100000 { 100000 } else if raw < -100000 { -100000 } else { raw }
+
+fn clamp_pulse(raw) -> PulseW with Pure =
+  if raw > 300000 { 300000 } else if raw < -300000 { -300000 } else { raw }
+
+fn clamp_soc(s) -> Soc with Pure = if s < 0 { 0 } else if s > 1000 { 1000 } else { s }
+
+// State of charge in thousandths of each machine's capacity.
+fn spin_soc_m(mwh) -> Soc with Pure = clamp_soc(mwh / 10000)
+
+fn pulse_soc_m(mwh) -> Soc with Pure = clamp_soc(mwh / 1200000)
+
+fn magnitude(x) with Pure = if x < 0 { 0 - x } else { x }
+
+// ─── The fast rules ──────────────────────────────────────────────────
+//
+// The proportional push: nothing within 36 mHz of 60 Hz, then a push that
+// grows with the deviation and is full 200 mHz past that band. A low
+// frequency means the grid is short of power, so Spin discharges.
+// `clamp_spin` keeps the command within Spin's rating.
+fn droop(hz: GridMhz) with Pure = {
+  let dev = hz - 60000
+  let past = magnitude(dev) - 36
+  if past <= 0 { 0 } else { clamp_spin(if dev < 0 { past * 500 } else { 0 - past * 500 }) }
+}
+
+// Full power from Spin against the deviation, while the fast-change rule holds.
+fn reflex(hz: GridMhz) -> SpinW with Pure = if hz < 60000 { 100000 } else { -100000 }
+
+// What the building draws this hour.
+fn facility_w(rush) with Pure = if rush == 1 { 300000 } else { 200000 }
+
+// ─── The machines and the log ────────────────────────────────────────
+//
+// Each machine's stored energy stays between empty and full.
+fn settle(e, full) with Pure = if e < 0 { 0 } else if e > full { full } else { e }
+
+// Spin's stored energy in milliwatt-hours: 10 kWh when full, 94 percent at
+// the start. Pulse's: 1,200 kWh when full, 62 percent at the start, and
+// charged up to 95 percent. One 50 ms tick at w watts moves w / 72 mWh. An
+// empty machine gives nothing and a full one takes nothing, so what a
+// machine answers is what it does. `report` writes the line from the last
+// answers and the energy left.
+handler station with spin_e = 9400000, pulse_e = 744000000, spin_w = 0, pulse_w = 0, why = Listening, number = 0 {
+  spin(ask) => {
+    let w = clamp_spin(if ask > 0 && spin_e <= 0 || ask < 0 && spin_e >= 10000000 { 0 } else { ask })
+    resume(w) with spin_e = settle(spin_e - w / 72, 10000000), spin_w = w
+  },
+  pulse(ask) => {
+    let w =
+      clamp_pulse(if ask > 0 && pulse_e <= 0 || ask < 0 && pulse_e >= 1140000000 { 0 } else { ask })
+    resume(w) with pulse_e = settle(pulse_e - w / 72, 1200000000), pulse_w = w
+  },
+  because(r, n) => resume() with why = r, number = n,
+  report(stamp, mode) => {
+    print_string("\{\"t\":{stamp},\"mode\":\"{mode_word(mode)}\",\"spin_w\":{spin_w},\"pulse_w\":{pulse_w},\"spin_soc_m\":{spin_soc_m(spin_e)},\"pulse_soc_m\":{pulse_soc_m(pulse_e)},\"reason\":\"{reason_text(why, number, spin_w, pulse_w)}\"\}\n")
+    resume()
+  },
+}
+
+// ─── The decision ────────────────────────────────────────────────────
+//
+// `valid` is 1 when the ear has a reading. `hz` is in millihertz, `rocof`
+// (the rate of change) in millihertz per second, `level` in thousandths of
+// a decibel, `hour` is the local hour, `rush` is 1 inside the rush-hour
+// window, and `clean` is the clean share of the hour's power in
+// thousandths. The function commands the machines, records its reason and
+// returns the mode.
+fn decide(valid, hz: Int, rocof, level, hour, rush, clean) with !Alloc + !Network + !Filesystem + !WASI + !Trap = {
+  // The level's ten-second average. The first reading sets it, it stays
+  // fixed while the hum is gone, and it is zero until a hum has been heard.
+  let reference = {
+    p => if valid == 0 {
+      p
+    } else if p == 0 {
+      level
+    } else if level < p - 30000 {
+      p
+    } else {
+      p + (level - p) / 200
+    },
+  } <~ delay(1)
+  let lost_now = reference != 0 && (valid == 0 || level < reference - 30000)
+  let lost_n = { c => if lost_now { c + 1 } else { 0 } } <~ delay(1)
+  let found_n = { c => if valid == 1 && level > reference - 10000 { c + 1 } else { 0 } } <~ delay(1)
+  let island =
+    { s => if s == 1 { if found_n >= 2 { 0 } else { 1 } } else if lost_n >= 6 { 1 } else { 0 } } <~ delay(1)
+  let island_t = { t => if island == 1 { t + 1 } else { 0 } } <~ delay(1)
+  let in_band = valid == 1 && hz > 55000 && hz < 65000
+  let rate = magnitude(rocof)
+  let off = if in_band { magnitude(hz - 60000) } else { 0 }
+  // How many ticks the fast-change rule has held. It starts when the rate
+  // passes 100 mHz per second. After two seconds it ends once the rate is
+  // calm, unless the deviation still calls for more than half of Spin's
+  // rating, and it never runs past ten seconds.
+  let event_t = {
+    t => if island == 1 || in_band == false {
+      0
+    } else if t > 0 {
+      if t >= 200 || rate < 50 && t >= 40 && off < 136 { 0 } else { t + 1 }
+    } else if rate > 100 {
+      1
+    } else {
+      0
+    },
+  } <~ delay(1)
+  // Spin's command from the fast rules: full power while the fast-change
+  // rule holds, otherwise the proportional push, and zero when neither
+  // applies.
+  let fast = if in_band && hz > 55000 && hz < 65000 {
+    if event_t > 0 { reflex(hz) } else { droop(hz) }
+  } else {
+    0
+  }
+  // The mode reads EVENT while the fast rules push at least 10 kW and for
+  // two seconds after, so a frequency hovering at the band's edge does not
+  // make the word flicker.
+  let acting =
+    { h => if event_t > 0 || magnitude(fast) >= 10000 { 40 } else if h > 0 { h - 1 } else { 0 } } <~ delay(1)
+  let draw = facility_w(rush)
+  // What Spin is asked for: full power in an island's first two seconds, the
+  // fast rules' command, or a top-up from Pulse when all is calm. Spin
+  // answers with what it gives once its stored energy is checked.
+  let spin_w = spin(if island == 1 {
+    if island_t <= 40 { 100000 } else { 0 }
+  } else if fast != 0 {
+    fast
+  } else if in_band {
+    -20000
+  } else {
+    0
+  })
+  // What Pulse is asked for: the building's load in an island, full power
+  // in rush hour, a charge in a clean hour unless the grid is short of power
+  // (the fast rules are pushing), plus whatever Spin's top-up draws.
+  let pulse_ask = if island == 1 {
+    if island_t <= 40 { draw - spin_w } else { draw }
+  } else if rush == 1 {
+    300000
+  } else if clean >= 400 && fast <= 0 {
+    -150000
+  } else {
+    0
+  }
+  let pulse_w = pulse(if spin_w < 0 && island == 0 { pulse_ask - spin_w } else { pulse_ask })
+  // The reason and the number it quotes. `reason_text` turns them into words
+  // in the handler, because building a string allocates.
+  if island == 1 {
+    if island_t <= 40 { because(HumGone, reference - level) } else { because(Islanded, island_t / 20) }
+  } else if valid == 0 {
+    because(Listening, 0)
+  } else if event_t == 1 {
+    because(if rocof < 0 { Falling } else { Rising }, rocof)
+  } else if event_t > 1 {
+    because(Holding, hz - 60000)
+  } else if fast != 0 {
+    because(if spin_w == 0 { SpinEmpty } else { Pushing }, hz - 60000)
+  } else if rush == 1 {
+    because(RushHour, hour)
+  } else if pulse_w < 0 {
+    because(Charging, clean)
+  } else if spin_w < 0 {
+    because(TopUp, 0)
+  } else {
+    because(Steady, 0)
+  }
+  if island == 1 { Island } else if acting > 0 { Event } else if rush == 1 { Rush } else { Grid }
+}
+
+// ─── The words ───────────────────────────────────────────────────────
+fn mode_word(mode) with Pure = match mode {
+  Grid => "GRID",
+  Event => "EVENT",
+  Rush => "RUSH",
+  Island => "ISLAND",
+}
+
+// A value in thousandths as a decimal with one place, such as 12.3.
+fn tenths(m) = {
+  let sign = if m < 0 { "-" } else { "" }
+  let a = magnitude(m)
+  "{sign}{a / 1000}.{a % 1000 / 100}"
+}
+
+// A deviation in millihertz as the words "41 mHz low" or "41 mHz high".
+fn off_words(dev) = if dev < 0 { "{0 - dev} mHz low" } else { "{dev} mHz high" }
+
+fn reason_text(why, number, spin_w, pulse_w) = match why {
+  Listening => "listening",
+  Steady => "within 36 mHz of 60, nothing to do",
+  Pushing => if spin_w > 0 {
+    "{off_words(number)}: Spin pushing {spin_w / 1000} kW"
+  } else {
+    "{off_words(number)}: Spin absorbing {0 - spin_w / 1000} kW"
+  },
+  Falling => "falling at {0 - number} mHz per second, past 100",
+  Rising => "rising at {number} mHz per second, past 100",
+  Holding => "holding full power, {off_words(number)}",
+  RushHour => "rush hour, hour {number}: Pulse carries the building at {pulse_w / 1000} kW",
+  Charging => "clean hour, {number / 10} percent clean: Pulse charging at {0 - pulse_w / 1000} kW",
+  TopUp => "within 36 mHz of 60; Spin topping up from Pulse at {0 - spin_w / 1000} kW",
+  SpinEmpty => "{off_words(number)} and Spin is empty",
+  Islanded => "islanded {number} s: Pulse carries the building",
+  HumGone => "the hum is gone, {tenths(number)} dB under its average: Spin carries the first seconds",
+}
+
+// ─── Reading the line's numbers as integers ──────────────────────────
+//
+// The byte at position k of the text, or -1 past either end. Every read of
+// the line goes through this one function, and the compiler proves that the
+// read stays inside the text, so no line the ear sends can stop the Station
+// with an error.
+fn at(s: String, k) -> Int with !Trap = if k >= 0 && k < len(s) { s[k] } else { -1 }
+
+// The position after `"key":` in the line, or -1.
+fn find_key(line, key: String) = find_from(line, "\"{key}\":", 0)
+
+fn find_from(hay, needle, i) = if at(hay, i) < 0 {
+  -1
+} else if matches_at(hay, needle, i, 0) {
+  i + len(needle)
+} else {
+  find_from(hay, needle, i + 1)
+}
+
+// Whether the needle from its byte j on matches the hay from byte i + j on.
+fn matches_at(hay, needle, i, j) = {
+  let b = at(needle, j)
+  if b < 0 { true } else if at(hay, i + j) == b { matches_at(hay, needle, i, j + 1) } else { false }
+}
+
+fn is_digit(b) with Pure = b >= 48 && b <= 57
+
+// JSON allows spaces after the colon, so the value starts after them.
+fn skip_spaces(s, i) = if at(s, i) == 32 { skip_spaces(s, i + 1) } else { i }
+
+// The JSON number at `pos` as an integer in thousandths: the sign, the
+// whole digits, the first three decimals, and an exponent if there is one.
+fn milli_at(s, pos) = {
+  let neg = at(s, pos) == 45
+  let p0 = if neg { pos + 1 } else { pos }
+  let p1 = whole_end(s, p0)
+  let whole = digits_value(s, p0, p1, 0)
+  let frac = if at(s, p1) == 46 { frac_value(s, p1 + 1, 0, 0) } else { 0 }
+  let p2 = number_end(s, p1)
+  let scaled = exponent_scale(s, p2, whole * 1000 + frac)
+  if neg { 0 - scaled } else { scaled }
+}
+
+fn whole_end(s, i) = if is_digit(at(s, i)) { whole_end(s, i + 1) } else { i }
+
+fn digits_value(s, i, end, acc) =
+  if i >= end { acc } else { digits_value(s, i + 1, end, acc * 10 + (at(s, i) - 48)) }
+
+// Only the first three decimals count; the rest of the fraction is skipped.
+fn frac_value(s, i, k, acc) = if is_digit(at(s, i)) {
+  if k < 3 {
+    frac_value(s, i + 1, k + 1, acc * 10 + (at(s, i) - 48))
+  } else {
+    frac_value(s, i + 1, k + 1, acc)
+  }
+} else if k == 0 {
+  0
+} else if k == 1 {
+  acc * 100
+} else if k == 2 {
+  acc * 10
+} else {
+  acc
+}
+
+fn number_end(s, i) = {
+  let b = at(s, i)
+  if is_digit(b) || b == 46 { number_end(s, i + 1) } else { i }
+}
+
+// An exponent such as e-05: the value scaled by it, rounded toward zero.
+fn exponent_scale(s, i, v) = if at(s, i) == 101 || at(s, i) == 69 {
+  let neg = at(s, i + 1) == 45
+  let p = if at(s, i + 1) == 45 || at(s, i + 1) == 43 { i + 2 } else { i + 1 }
+  let e = digits_value(s, p, whole_end(s, p), 0)
+  if neg { shrink(v, e) } else { grow(v, e) }
+} else {
+  v
+}
+
+fn shrink(v, e) = if e <= 0 { v } else { shrink(v / 10, e - 1) }
+
+fn grow(v, e) = if e <= 0 { v } else { grow(v * 10, e - 1) }
+
+// A numeric field in thousandths, or None when the ear has no reading (the
+// field is null) or the field is missing.
+fn field(line, key) = {
+  let after = find_key(line, key)
+  if after < 0 {
+    None
+  } else {
+    let pos = skip_spaces(line, after)
+    let b = at(line, pos)
+    if b < 0 || b == 110 { None } else { Some(milli_at(line, pos)) }
+  }
+}
+
+fn field_or(line, key, fallback) = match field(line, key) {
+  Some(v) => v,
+  None => fallback,
+}
+
+// The reading's timestamp, kept as the text it arrived in, so the decision
+// line carries it back without converting it. The cut's bounds are stated
+// where it is cut, and the compiler proves the cut stays inside the line.
+fn stamp(line) = {
+  let after = find_key(line, "t")
+  if after < 0 {
+    "0"
+  } else {
+    let pos = skip_spaces(line, after)
+    let end = number_end(line, pos)
+    if 0 <= pos && pos < end && end <= len(line) { str_slice(line, pos, end) } else { "0" }
+  }
+}
+
+// ─── The loop ────────────────────────────────────────────────────────
+//
+// One reading: a line in, a decision line out. It answers whether there was
+// a line.
+fn reading() = {
+  let line = read_stdin_line()
+  if len(line) == 0 {
+    false
+  } else {
+    let hz = field(line, "hz_fast")
+    let valid = match hz {
+      Some(_) => 1,
+      None => 0,
+    }
+    let hz_m = match hz {
+      Some(v) => v,
+      None => 0,
+    }
+    let mode = decide(
+      valid,
+      hz_m,
+      field_or(line, "rocof", 0),
+      field_or(line, "level_db", 0),
+      field_or(line, "hour_local", 0) / 1000,
+      field_or(line, "rush", 0) / 1000,
+      field_or(line, "clean", 0)
+    )
+    report(stamp(line), mode)
+    true
+  }
+}
+
+// Each reading runs inside its own arena, so what it allocated is reclaimed
+// before the next one starts.
+fn step() = if reading() ~> arena { step() }
+
+fn main() = {
+  step()
+  0
+} ~> station

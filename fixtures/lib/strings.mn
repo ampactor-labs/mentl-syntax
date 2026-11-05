@@ -1,0 +1,1097 @@
+// strings.mn — the String face of the ONE sequence node-kind (§4①)
+//
+// A String IS [byte]: a stride-1 sequence record, identical in layout to
+// every other list — [count@0][tag_word@+4][payload@+8], where the tag word
+// carries pack_tag(tag, sc) (lists.mn's zero-biased stride carrier; a byte
+// sequence writes sc 1). There is no second string shape: slices are the
+// list slice node (tag 4), lazy concat is the list concat node (tag 3), and
+// every byte read routes through the ONE tag-dispatched, stride-honest
+// list_index (byte_at IS list_index; byte_len IS len).
+//
+// The bespoke string machinery this file once carried — the sign-bit VIEW
+// record, its flat/view discriminant, the eager copying concat — dissolved
+// into the sequence substrate. What remains here is the byte-sequence
+// INSTANCE of each structural leaf (str_eq / str_compare / str_hash — the
+// [byte] cases of the one eq/compare/hash derivation), the text builders
+// (int_to_str, float_to_str, str_unescape), the parse family, and the
+// sorted-string-set vocabulary.
+//
+// SUBSTRATE-HONEST DESIGN per the eight interrogations:
+//   Graph: one sequence kind; the byte face is a projection, never a fork
+//   Handler: +Memory for reads; +Alloc only at build/concat/materialize
+//   Verb: |> sequential walk via byte_at — no copy
+//   Row: concat is O(1) node alloc; slice O(1) view node — never O(N) copies
+//   Ownership: slices/concats borrow their sources; str_payload materializes
+//   Refinement: list_index carries the bounds trap (SYNTAX §Indexing)
+//   Gradient: stride is representation freedom — the carrier keeps every
+//             read honest; boundaries (str_payload) normalize to stride 1
+//   Reason: provenance preserved — slice/concat nodes point at their sources
+//
+// Effects declared in std/compiler/types.mn:
+//   Memory: load_i32, store_i32, load_i8, store_i8, mem_copy, byte_at, byte_len
+//   Alloc:  alloc(size) -> Addr
+//
+// A String IS [byte] (§4①): its byte face is the sequence face. byte_len IS
+// len (the count at +0, shape-invariant across flat/slice/concat); byte_at IS
+// list_index — the carrier reads the byte at stride 1 (load_i8 of the
+// address 8 + i bytes into the record),
+// tag-dispatched over every representation. The byte VALUE returns as a word
+// (repr RI32), ground-equal to Int at check level (same_ground), so byte
+// arithmetic and comparisons read naturally; the SLOT stays stride-1, guarded
+// by the carrier on reads and the store_strided range trap on writes.
+fn byte_len(s) = len(s)
+
+fn byte_at(s, i) = list_index(s, i)
+
+// Equality and ordering — walk via byte_at so view/flat dispatch is
+// transparent at observer sites. byte_len gives the comparable length.
+fn str_eq_loop(a, b, slen, i) -> Bool = if i >= slen {
+  true
+} else {
+  if byte_at(a, i) != byte_at(b, i) { false } else { str_eq_loop(a, b, slen, i + 1) }
+}
+
+// str_eq — byte-exact equality: the [byte] INSTANCE of the one structural
+// `==` derivation (SYNTAX §Equality). Surface `==` on strings lowers HERE
+// (emit_eq_for_ty's byte-sequence arm) — pointer comparison is unsayable.
+// The name survives for the runtime's own walkers; user code writes `==`.
+fn str_eq(a, b) -> Bool = {
+  let la = byte_len(a)
+  let lb = byte_len(b)
+  if la != lb { false } else { str_eq_loop(a, b, la, 0) }
+}
+
+// str_eq_at — a[0..len(a)) == src[s..e) without minting the slice: the
+// intern probe's compare (a canonical instance against a source range).
+// Same byte walk as str_eq; the range spelling is what lets a repeat
+// identifier occurrence resolve with zero allocation.
+fn str_eq_at(a, src, s, e) -> Bool = {
+  let n = byte_len(a)
+  if n != e - s { false } else { str_eq_at_loop(a, src, s, 0, n) }
+}
+
+fn str_eq_at_loop(a, src, s, i, n) -> Bool = if i >= n {
+  true
+} else if byte_at(a, i) != byte_at(src, s + i) {
+  false
+} else {
+  str_eq_at_loop(a, src, s, i + 1, n)
+}
+
+fn str_lt_loop(a, b, la, lb, i) -> Bool = if i >= la && i >= lb {
+  false
+} else if i >= la {
+  true
+} else if i >= lb {
+  false
+} else {
+  let ca = byte_at(a, i)
+  let cb = byte_at(b, i)
+  if ca < cb { true } else if ca > cb { false } else { str_lt_loop(a, b, la, lb, i + 1) }
+}
+
+// str_lt — lexicographic less-than. Returns Bool.
+fn str_lt(a, b) -> Bool = {
+  let la = byte_len(a)
+  let lb = byte_len(b)
+  str_lt_loop(a, b, la, lb, 0)
+}
+
+// str_compare — the 3-way lexicographic ordering: the [Byte] instance of the
+// ONE compare leaf (SYNTAX.md §Equality's ordering sibling). Returns -1 / 0 / 1
+// so a generated $compare_<sig> fold can short-circuit on the first non-equal
+// element (a Bool str_lt cannot — it loses the "equal so far, keep going"
+// signal). Byte-exact, walking via byte_at so view/flat dispatch is
+// transparent; the first differing byte decides, else the shorter string is
+// less (the [a]/[Byte] instance of length-then-element ordering).
+fn str_compare_loop(a, b, la, lb, i) -> Int = if i >= la && i >= lb {
+  0
+} else if i >= la {
+  -1
+} else if i >= lb {
+  1
+} else {
+  let ca = byte_at(a, i)
+  let cb = byte_at(b, i)
+  if ca < cb { -1 } else if ca > cb { 1 } else { str_compare_loop(a, b, la, lb, i + 1) }
+}
+
+fn str_compare(a, b) -> Int = {
+  let la = byte_len(a)
+  let lb = byte_len(b)
+  str_compare_loop(a, b, la, lb, 0)
+}
+
+// str_contains — is `needle` a byte-substring of `haystack`? One read: at
+// each start position where the needle still fits, the O(1) [Byte] VIEW of
+// that window compares by the structural `==` (the str_eq instance) — the
+// one sequence-eq derivation reused, no second byte-matcher. Empty needle
+// is contained; a needle longer than the haystack is not. The row carries
+// +Alloc honestly (each window is a 16-byte view record) until band-I
+// fusion tightens the view away.
+fn str_contains(haystack: String, needle: String) -> Bool = {
+  let hlen = byte_len(haystack)
+  let nlen = byte_len(needle)
+  if nlen == 0 {
+    true
+  } else if nlen > hlen {
+    false
+  } else {
+    range(0, hlen - nlen + 1) |> any((i) => needle == str_slice(haystack, i, i + nlen))
+  }
+}
+
+// str_hash — FNV-1a over the bytes: the [Byte] instance of the ONE hash leaf.
+// Structural-equal strings (byte-equal) hash equal by construction (str_eq ⇒
+// str_hash equal — the eq/hash agreement the whole fold enforces). The SAME
+// FNV mix cache.mn's hash_source uses (offset basis 2166136261, prime 16777619);
+// the generated $hash_<sig> fold mixes a string field by calling this.
+fn str_hash_loop(s, i, n, h) -> Int =
+  if i >= n { h } else { str_hash_loop(s, i + 1, n, i32_xor(h, byte_at(s, i)) * 16777619) }
+
+fn str_hash(s) -> Int = str_hash_loop(s, 0, byte_len(s), -2128831035)
+
+// Concatenation and slicing — a String IS [byte] (§4①), so these ARE the
+// sequence ops: concat IS ++ (list_concat, an O(1) lazy concat node — strictly
+// better than the old eager materialize), slice IS slice (a tag-4 view node).
+// The sign-bit view shape and view_base dissolve into the list slice tag.
+// The String pins are Intent Boundaries: they resolve the body's `++` to the
+// byte-sequence concat at emit (an unresolved-element `++` refuses, the
+// no-silent-fallback law).
+fn str_concat(a: String, b: String) = a ++ b
+
+// str_concat_all — the N-ary materialize: two tail-recursive passes (sum the
+// lengths, then pack each part's contiguous payload into one fresh byte
+// record). O(total) bytes, O(1) stack per part — a right-fold of ++ here
+// would build O(N) stack and a depth-N tree (the call-stack exhaustion the
+// first ladder run measured); the pairwise `++` rope stays the right shape
+// for CHAINS, the packer for N-ary joins.
+fn str_concat_all(xs: [String]) = {
+  let n = len(xs)
+  let total = sum_byte_lens(xs, 0, n, 0)
+  let dest = bytes_buf(total)
+  fill_concat_all(xs, 0, n, dest, 0)
+  str_of_buf(dest)
+}
+
+fn sum_byte_lens(xs: [String], i, n, acc) =
+  if i >= n { acc } else { sum_byte_lens(xs, i + 1, n, acc + byte_len(list_index(xs, i))) }
+
+fn fill_concat_all(xs: [String], i, n, dest, w) = if i >= n {
+  ()
+} else {
+  let s = list_index(xs, i)
+  let m = byte_len(s)
+  mem_copy(addr_at(dest, 8 + w), str_payload(s), m)
+  fill_concat_all(xs, i + 1, n, dest, w + m)
+}
+
+fn str_slice(s, start, end) = slice(s, start, end)
+
+// str_payload(s) — the address of s's byte_len(s) CONTIGUOUS stride-1 bytes:
+// THE materialization boundary. A rope/slice flattens first (list_to_flat, a
+// no-op on a flat record); a byte sequence whose record carries a wider
+// stride — a [byte] built through generic word-list construction, since
+// stride is representation freedom under the carrier — REPACKS to stride 1
+// here, exactly where WASI demands contiguity. fd_write / sock_write / the
+// path syscalls all read this one projection.
+fn str_payload(s) = {
+  let flat = flat_raw(s)
+  if seq_stride(flat) == 1 {
+    addr_at(flat, 8)
+  } else {
+    addr_at(str_repack_stride1(flat, seq_stride(flat)), 8)
+  }
+}
+
+// The stride-1 repack: copy each element word into a fresh byte record. The
+// values are byte-ranged by type ([byte]); store_strided's range trap keeps a
+// violation loud, never a silent wrap.
+fn str_repack_stride1(flat, stride) = {
+  let n = load_i32(flat)
+  let dest = bytes_buf(n)
+  str_repack_loop(flat, dest, stride, 0, n)
+  dest
+}
+
+fn str_repack_loop(flat, dest, stride, i, n) = if i >= n {
+  ()
+} else {
+  store_i8(addr_at(dest, 8 + i), load_strided(addr_at(flat, 8), i, stride))
+  str_repack_loop(flat, dest, stride, i + 1, n)
+}
+
+// split — sep-delimited tokens as zero-copy views into s (one
+// str_slice per token; no byte copies). One O(N) walk; buffer-
+// counter substrate per CLAUDE.md (list_extend_to + list_set +
+// slice — no ++ in the loop). Adjacent separators yield empty
+// tokens; empty input yields [""]; empty sep yields [s].
+//
+// Separator first, datum last — the Stage Law: both arguments are String,
+// so the order is the contract `"a,b,c" |> split(",")` stands on.
+fn split(sep: String, s: String) = {
+  let n = byte_len(s)
+  let seplen = byte_len(sep)
+  if seplen == 0 { [s] } else { split_walk(s, sep, n, seplen, 0, 0, make_list(0), 0) }
+}
+
+fn split_walk(s, sep, n, seplen, i, start, buf, count) = if i + seplen > n {
+  let grown = list_extend_to(buf, count + 1)
+  list_set(grown, count, str_slice(s, start, n))
+  slice(grown, 0, count + 1)
+} else if sep_at(s, sep, i, seplen, 0) {
+  let grown = list_extend_to(buf, count + 1)
+  list_set(grown, count, str_slice(s, start, i))
+  split_walk(s, sep, n, seplen, i + seplen, i + seplen, grown, count + 1)
+} else {
+  split_walk(s, sep, n, seplen, i + 1, start, buf, count)
+}
+
+fn sep_at(s, sep, i, seplen, j) = if j >= seplen {
+  true
+} else if byte_at(s, i + j) == byte_at(sep, j) {
+  sep_at(s, sep, i, seplen, j + 1)
+} else {
+  false
+}
+
+// str_unescape — resolve the SYNTAX.md Strings escape codes in a string
+// literal's raw source bytes: \n→LF \r→CR \t→TAB \0→NUL; \xHH→the byte
+// with that two-hex-digit value; \\ \" \{ \} and any other \X → the
+// second byte literally. A lone trailing `\` (no following byte) stays a
+// literal backslash. The lexer projects source bytes → graph bytes, per
+// Hβ.first-light.lexer-string-escape-substrate. Two-pass: count decoded
+// length, then one alloc + byte-store fill. The two-pass IS the
+// O(N²)-bomb avoidance the scan_string comment warns about — a single
+// alloc, no per-byte str_concat. A `\xHH` consumes four source bytes
+// (backslash, x, hex, hex) and decodes to one byte, so the count and fill
+// passes step by four and emit one byte for that form.
+fn str_unescape(s) = {
+  let n = byte_len(s)
+  let dlen = str_unescape_count(s, 0, n, 0)
+  let ptr = bytes_buf(dlen)
+  str_unescape_into(s, 0, n, ptr, 0)
+  str_of_buf(ptr)
+}
+
+// is_hex_byte / hex_val — hex-digit classification and value for the
+// `\xHH` escape. 0-9 → 0..9, A-F → 10..15, a-f → 10..15.
+fn is_hex_byte(b) with Pure = b >= 48 && b <= 57 || b >= 65 && b <= 70 || b >= 97 && b <= 102
+
+fn hex_val(b) with Pure =
+  if b >= 48 && b <= 57 { b - 48 } else if b >= 65 && b <= 70 { b - 55 } else { b - 87 }
+
+// is_hex_escape — true when source bytes at `i` begin a complete `\xHH`
+// (backslash, x, two hex digits) within the [i, n) window.
+fn is_hex_escape(s, i, n) =
+  i + 3 < n && byte_at(s, i) == 92 && byte_at(s, i + 1) == 120 && is_hex_byte(byte_at(s, i + 2)) && is_hex_byte(byte_at(s, i + 3))
+
+fn str_unescape_count(s, i, n, acc) = if i >= n {
+  acc
+} else if is_hex_escape(s, i, n) {
+  str_unescape_count(s, i + 4, n, acc + 1)
+} else if byte_at(s, i) == 92 && i + 1 < n {
+  str_unescape_count(s, i + 2, n, acc + 1)
+} else {
+  str_unescape_count(s, i + 1, n, acc + 1)
+}
+
+fn str_unescape_into(s, i, n, dest, w) = if i >= n {
+  ()
+} else if is_hex_escape(s, i, n) {
+  let decoded = hex_val(byte_at(s, i + 2)) * 16 + hex_val(byte_at(s, i + 3))
+  store_i8(addr_at(dest, 8 + w), decoded)
+  str_unescape_into(s, i + 4, n, dest, w + 1)
+} else if byte_at(s, i) == 92 && i + 1 < n {
+  let esc = byte_at(s, i + 1)
+  let decoded = if esc == 110 {
+    10
+  } else if esc == 114 {
+    13
+  } else if esc == 116 {
+    9
+  } else if esc == 48 {
+    0
+  } else {
+    esc
+  }
+  store_i8(addr_at(dest, 8 + w), decoded)
+  str_unescape_into(s, i + 2, n, dest, w + 1)
+} else {
+  store_i8(addr_at(dest, 8 + w), byte_at(s, i))
+  str_unescape_into(s, i + 1, n, dest, w + 1)
+}
+
+// str_escape — str_unescape's exact inverse: graph bytes → the source
+// spelling SYNTAX declares (`\n \r \t \\ \" \{ \} \0 \xHH`). The formatter
+// is the parse's inverse, so a string that decoded from any of those must
+// render back to one of them: a raw control byte in canonical source is a
+// render that lost its escape.
+// Two passes over the bytes, both as topology: a pure fold counts the
+// escaped length for the one allocation, then `each` streams every byte's
+// spelling into a `ByteSink` whose write cursor is the handler's state —
+// no walk threads an index (the iteration-shape tier's own law).
+// A control byte with no short spelling renders as `\xHH`, lowercase — the
+// emitter's own data escapes spell hex the same way, from the same glyphs.
+fn str_escape(s) = {
+  let ptr = s |> fold(0, escape_len_acc) |> bytes_buf
+  s |> each(escape_emit) ~> byte_sink(ptr)
+  str_of_buf(ptr)
+}
+
+fn escape_len_acc(acc, b) with Pure = acc + escape_len(b)
+
+// A byte stream landing in a flat buffer: the sink owns the cursor.
+effect ByteSink {
+  emit_byte(b)
+}
+
+handler byte_sink(dest) with w = 0 {
+  emit_byte(b) => {
+    store_i8(addr_at(dest, 8 + w), b)
+    resume() with w = w + 1
+  },
+}
+
+// One byte's spelling, streamed: itself, `\` and a letter, or `\xHH`.
+fn escape_emit(b) = {
+  let k = escape_len(b)
+  if k == 1 {
+    emit_byte(b)
+  } else if k == 2 {
+    emit_byte(92)
+    emit_byte(escape_tail(b))
+  } else {
+    emit_byte(92)
+    emit_byte(120)
+    emit_byte(hex_nibble(i32_and(b / 16, 15)))
+    emit_byte(hex_nibble(i32_and(b, 15)))
+  }
+}
+
+// The short escapes: backslash, quote, the splice braces, newline, return,
+// tab, NUL — each two source bytes. Everything else below 32, and 127, is a
+// four-byte `\xHH`; the rest is itself.
+fn escape_len(b) with Pure = if b == 92 || b == 34 || b == 123 || b == 125 || b == 10 || b == 13 || b == 9 || b == 0 {
+  2
+} else if b < 32 || b == 127 {
+  4
+} else {
+  1
+}
+
+// The second byte of a two-byte escape (the letter after the backslash).
+fn escape_tail(b) with Pure =
+  if b == 10 { 110 } else if b == 13 { 114 } else if b == 9 { 116 } else if b == 0 { 48 } else { b }
+
+// The sixteen hex glyphs, one home: the formatter's `\xHH` reads one byte
+// of it, the emitter's `\HH` data escapes read a one-glyph slice.
+fn hex_glyphs() with Pure = "0123456789abcdef"
+
+fn hex_nibble(v) = byte_at(hex_glyphs(), v)
+
+// Integer conversion
+//
+// int_to_str — decimal representation of a signed 32-bit integer.
+// Handles negative numbers and zero correctly.
+// Digit-wise: no sprintf, no lookup table beyond '0'+digit.
+//
+// "0"
+fn int_to_str(n) = if n == 0 {
+  str_of_single_byte(48)
+} else if n == -2147483648 {
+  // INT_MIN can't be negated in i32 (0 - INT_MIN = INT_MIN), so its
+  // spelling is the literal.
+  "-2147483648"
+} else if n < 0 {
+  // "-"
+  let neg = str_of_single_byte(45)
+  let abs = 0 - n
+  let digits = int_to_str_positive(abs)
+  neg ++ digits
+} else {
+  int_to_str_positive(n)
+}
+
+// show_word's generic param instantiates fresh per call site, so
+// to_string stays polymorphic at infer (no Int contamination of
+// generic callers like assert_eq). The default handler renders the
+// kernel-uniform-i32 value word; the gradient's post-L1 typed
+// show-derivation is a handler swap (Hβ.lower.to-string-show-
+// derivation), not a rewrite. The emit-time dispatch
+// (show_node_of, backends/wasm.mn) short-circuits proven sites
+// (String text-view identity / TFloat float_to_str / TInt int_to_str)
+// before the op round-trip. NOT the v1 dispatch-by-magnitude tumor
+// — the type is proven by the graph or deferred to the handler;
+// never guessed from the value.
+//
+// to_string — the SHOW surface. Lower intercepts the NAME into the
+// structural LShow node whose dispatch happens at emit (the LShow build),
+// so this body never runs; it exists as the seq-op raw altitude (typed
+// `a -> String` at the table, self-consistent word body here — the
+// slot_present pattern). The former Show effect and its default-handler shell
+// was the pre-LShow design's archaeology: an op that never
+// evidence-dispatches poisoned every caller's row with a contract no
+// artifact honored.
+fn to_string(x) = int_to_str(x)
+
+// hash — the HASH surface, to_string's exact mirror: lower intercepts the
+// name into the structural LHash node dispatched at emit; the raw word
+// body types self-consistently and never runs; the table carries a -> Int.
+fn hash(x) = x
+
+// str_of_buf — the construction boundary: the address of a filled
+// [count][tag_word][bytes] buffer IS a String, which IS [byte] (§4①, a handle
+// is a word). The identity projection that returns a builder's buffer as the
+// typed sequence its consumers read — the one way from an address back to a
+// structured value.
+fn str_of_buf(buf) with Pure = buf
+
+// bytes_buf(n) — allocate a fresh flat [byte] buffer for n bytes, headered as
+// the unified sequence record: [count=n @0][tag_word=pack_tag(0,1) @+4][bytes
+// @+8]. THE one home for byte-string construction; every builder fills its
+// bytes from addr_at(ptr, 8), so list_index reads them at stride 1 through
+// the carrier.
+fn bytes_buf(n) = {
+  let ptr = alloc(8 + n)
+  store_i32(ptr, n)
+  store_i32(addr_at(ptr, 4), pack_tag(0, 1))
+  ptr
+}
+
+fn str_of_single_byte(b) = {
+  let ptr = bytes_buf(1)
+  store_i8(addr_at(ptr, 8), b)
+  str_of_buf(ptr)
+}
+
+fn int_to_str_positive(n) = {
+  // Worst case: 10 decimal digits for i32 max (2147483647).
+  // Write digits right-to-left into a raw 10-byte scratch area, then copy.
+  let scratch = alloc(10)
+  let end_pos = 10
+  let used = int_write_digits(scratch, end_pos, n)
+  let len = end_pos - used
+  let dest = bytes_buf(len)
+  mem_copy(addr_at(dest, 8), addr_at(scratch, used), len)
+  str_of_buf(dest)
+}
+
+// int_write_digits — write decimal digits right-to-left into buf[0..10).
+// Returns the start offset of the first written digit (so length = 10 - start).
+fn int_write_digits(buf, pos, n) = if n == 0 {
+  pos
+} else {
+  let digit = n - n / 10 * 10
+  let new_pos = pos - 1
+  store_i8(addr_at(buf, new_pos), 48 + digit)
+  int_write_digits(buf, new_pos, n / 10)
+}
+
+// float_to_str — IEEE-754 aware decimal representation of a 64-bit
+// float. Handles NaN, +/-Infinity, -0.0, and normal/subnormal values.
+// Produces a human-readable decimal string with at most 17 significant
+// digits (enough for round-trip fidelity on f64).
+//
+// NOT an alias of int_to_str. Float and Int are distinct types with
+// distinct bit representations and distinct printing requirements.
+fn float_to_str(f) = if float_is_nan(f) {
+  "NaN"
+} else if float_is_inf(f) {
+  if float_is_negative(f) { "-Inf" } else { "Inf" }
+} else if float_is_zero(f) {
+  if float_is_negative(f) { "-0.0" } else { "0.0" }
+} else {
+  let negative = float_is_negative(f)
+  let abs_f = if negative { 0.0 - f } else { f }
+  let rendered = float_render_positive(abs_f)
+  if negative {
+    let minus = str_of_single_byte(45)
+    minus ++ rendered
+  } else {
+    rendered
+  }
+}
+
+// float_render_positive: render a positive non-special float as a decimal
+// string using the Grisu2-family strategy:
+//   1. Find the base-10 exponent e such that 1 <= f / 10^e < 10.
+//   2. Extract up to 17 significant decimal digits by repeated multiply.
+//   3. Format with decimal point or scientific notation as appropriate.
+// f pins : Float (the scaled: Float precedent below): every float contact in
+// this body is a FORWARD call (floor_log10/pow10/extract_digits all sit
+// after this fn in file order), so the body inferred against pre-scheme
+// free vars and f starved to the word floor — `f / pow10(exp)` emitted
+// i32.div_s against extract_digits' f64 slot (m3's one residual mismatch).
+// The inference-order completion is the named band
+// Hβ.infer.scc-ordered-walk; the pin is the Intent Boundary bridging it.
+// The SHORTEST FAITHFUL render: the fewest digits whose parse-back equals
+// the value exactly — 1.0 renders "1.0", never the seventeen-digit
+// inflation. The oracle is parse_float ITSELF (the lexer's own conversion,
+// lexer.mn's TFloatLit — one conversion, one home), so render∘parse
+// identity holds under the medium's real reader by construction. The
+// ascent tries the truncated digit run, then the last digit rounded up
+// (the 9-ripple case falls through to a longer run — always exact,
+// occasionally one digit past optimal); seventeen digits always suffice
+// for an f64, so the ascent terminates at today's render.
+fn float_render_positive(f: Float) = {
+  let exp = float_floor_log10(f)
+  // Normalize by the EXACT positive power: 10^k is representable through
+  // k = 22, so a negative exponent MULTIPLIES — one correctly-rounded
+  // step. Dividing by float_pow10(exp < 0) divided by an unrepresentable
+  // power (1/10 itself rounds) and skewed scaled a whole ulp near decade
+  // boundaries — 0.3 normalized to 2.9999999999999996 instead of 3.0.
+  // The re-clamp catches a normalization that rounds up across the
+  // decade (scaled landing exactly 10.0).
+  let scaled = if exp < 0 { f * float_pow10(0 - exp) } else { f / float_pow10(exp) }
+  if scaled >= 10.0 {
+    float_render_shortest(f, scaled / 10.0, exp + 1, 1)
+  } else {
+    float_render_shortest(f, scaled, exp, 1)
+  }
+}
+
+// The shortest render IS the emit form: parse_float is correctly rounded
+// over the exact-mantissa range (one f64-integer accumulation + one exact
+// power-of-ten scale), so its oracle below — parse_float(cand) == f — is
+// the same verdict the assembler's correctly-rounded reader gives on every
+// short candidate. The two readers agree; the separate seventeen-digit
+// bits render this agreement retired was compensating for the old
+// per-digit parse. The residue is the UNVERIFIED nd=17 tail (a value with
+// no shorter round-trip — never a lexed literal, whose own spelling is a
+// short witness): its digit extraction is float-stepped and can sit a ulp
+// off — Hβ.runtime.float-render-17-digit-exact names the exact-extraction
+// upgrade (digit generation from the stored bits read through memory).
+fn float_render_shortest(f: Float, scaled: Float, exp, nd) = {
+  let digits = float_extract_digits(scaled, 0, nd, make_list(nd))
+  let cand = float_format_digits(digits, exp)
+  if nd >= 17 {
+    cand
+  } else if parse_float(cand) == f {
+    cand
+  } else {
+    let last = digits[nd - 1]
+    if last < 9 {
+      let cand2 = float_format_digits(list_set(digits, nd - 1, last + 1), exp)
+      if parse_float(cand2) == f { cand2 } else { float_render_shortest(f, scaled, exp, nd + 1) }
+    } else {
+      float_render_shortest(f, scaled, exp, nd + 1)
+    }
+  }
+}
+
+// float_floor_log10: floor(log10(f)) for a finite positive f, found by
+// multiplying or dividing by 10 until 1 <= f < 10:
+// floor_log10(f) = floor_log10(f·10) − 1 below 1, and 1 + floor_log10(f/10)
+// from 10 up. Each step is paid from a budget of 400. A finite f64 lies
+// within 324 decades of 1, so a finite f never spends it; a value that is
+// not finite never reaches a decade, and the budget ends the walk there.
+fn float_floor_log10(f) with Pure = floor_log10_within(f, 400)
+
+fn floor_log10_within(f, steps) with Pure = if steps <= 0 {
+  0
+} else if f >= 1.0 && f < 10.0 {
+  0
+} else if f < 1.0 {
+  floor_log10_within(f * 10.0, steps - 1) - 1
+} else {
+  1 + floor_log10_within(f / 10.0, steps - 1)
+}
+
+// Up to max_digits decimal digits, most significant first, of a value whose
+// `scaled` is in [1, 10): each step's remaining fraction times ten is the
+// next step's scaled, so it stays in [0, 10). `acc` is a flat list of
+// max_digits slots, each digit landing by index (list_set's flat contract).
+fn float_extract_digits(scaled: Float, count, max_digits, acc) = if count >= max_digits {
+  acc
+} else {
+  let digit = decimal_digit(scaled)
+  let next = (scaled - float_of_int(digit)) * 10.0
+  float_extract_digits(next, count + 1, max_digits, list_set(acc, count, digit))
+}
+
+// The decimal digit of a value in [0, 10): how many of the units 1 through 9
+// it reaches, read by comparison alone, so no conversion is asked to hold it.
+fn decimal_digit(x: Float) -> Int with Pure = if x < 5.0 {
+  if x < 2.0 { if x < 1.0 { 0 } else { 1 } } else if x < 3.0 { 2 } else if x < 4.0 { 3 } else { 4 }
+} else if x < 7.0 {
+  if x < 6.0 { 5 } else { 6 }
+} else if x < 8.0 {
+  7
+} else if x < 9.0 {
+  8
+} else {
+  9
+}
+
+// float_format_digits: format a digit list and exponent into a decimal string.
+// Uses fixed notation for -4 <= exp <= 14, scientific otherwise.
+fn float_format_digits(digits, exp) = if exp >= -4 && exp <= 14 {
+  float_format_fixed(digits, exp)
+} else {
+  float_format_scientific(digits, exp)
+}
+
+fn float_format_fixed(digits, exp) = {
+  // exp=2 and digits=[1,2,3] → "123.0"
+  // exp=0 and digits=[1,2,3] → "1.23"
+  // exp=-1 and digits=[1,2,3] → "0.123"
+  // exp=-2 and digits=[1,2,3] → "0.0123"
+  // The digit list is exactly the FAITHFUL digits (the shortest render
+  // passes as few as one): the integer side zero-fills its tail through
+  // digit_at's total read, and the fraction ends at the LIST — the old
+  // fixed 17 end is what inflated every float to seventeen digits.
+  let n = len(digits)
+  let int_digits = exp + 1
+  if int_digits <= 0 {
+    // All digits are fractional; need leading zeros after "0."
+    //
+    // "0"
+    let zero = str_of_single_byte(48)
+    // "."
+    let dot = str_of_single_byte(46)
+    // |int_digits| zeros
+    let leading = float_zero_pad(0 - int_digits)
+    let frac = float_digits_to_str(digits, 0, n)
+    zero ++ dot ++ leading ++ frac
+  } else {
+    let int_part = float_digits_to_str(digits, 0, int_digits)
+    let frac_part = float_digits_to_str(digits, int_digits, n)
+    let dot = str_of_single_byte(46)
+    int_part ++ dot ++ frac_part
+  }
+}
+
+// Build a string of n '0' characters for fractional padding.
+fn float_zero_pad(n) = if n <= 0 {
+  str_of_buf(bytes_buf(0))
+} else {
+  let dest = bytes_buf(n)
+  float_fill_zeros(addr_at(dest, 8), 0, n)
+  str_of_buf(dest)
+}
+
+fn float_fill_zeros(ptr, i, n) = if i >= n {
+  ()
+} else {
+  store_i8(addr_at(ptr, i), 48)
+  float_fill_zeros(ptr, i + 1, n)
+}
+
+fn float_format_scientific(digits, exp) = {
+  let mantissa = float_format_fixed(digits, 0)
+  // 'e'
+  let e_char = str_of_single_byte(101)
+  let exp_str = int_to_str(exp)
+  mantissa ++ e_char ++ exp_str
+}
+
+// float_digits_to_str: convert a slice of the digit list to a string.
+// Pads with '0' if the requested range exceeds available digits.
+//
+// "0" minimum
+fn float_digits_to_str(digits, start, end) = if start >= end {
+  str_of_single_byte(48)
+} else {
+  let len = end - start
+  let dest = bytes_buf(len)
+  float_fill_digit_bytes(addr_at(dest, 8), digits, start, end, start)
+  str_of_buf(dest)
+}
+
+fn float_fill_digit_bytes(buf, digits, start, end, i) = if i >= end {
+  ()
+} else {
+  // digits[i], NOT digits[i - start]: i already walks [start, end) over
+  // the digit list; subtracting start re-read from digit 0, so every
+  // fraction after a nonzero integer part duplicated the integer digits
+  // ("1.5" rendered "1.15", "2.0" "2.2" — every f64 constant m2 emitted
+  // into m3 was textually corrupt; 0.25-class values masked it because
+  // their int part IS digit-empty, start=0). The buffer index (i - start)
+  // stays relative.
+  let d = digit_at(digits, i)
+  store_i8(addr_at(buf, i - start), 48 + d)
+  float_fill_digit_bytes(buf, digits, start, end, i + 1)
+}
+
+fn float_pow10(exp) with Pure = if exp >= 0 { pow10_up(exp) } else { 1.0 / pow10_up(0 - exp) }
+
+// Ten to a power that is not negative, one factor at a time.
+fn pow10_up(n) with Pure = if n > 0 { 10.0 * pow10_up(n - 1) } else { 1.0 }
+
+// The NaN idiom is Float-only by meaning: at i32, ne(f, f) is
+// constantly false and detects nothing. The pin states the domain.
+fn float_is_nan(f: Float) = f != f
+
+// IEEE identity, no threshold literal: finite f has f - f == 0.0; ±Inf has
+// Inf - Inf = NaN (never equal to itself); NaN fails the f == f guard.
+fn float_is_inf(f: Float) = f == f && f - f != f - f
+
+fn float_is_zero(f) = f == 0.0 || f == 0.0 - 0.0
+
+fn float_is_negative(f) = f < 0.0 || float_is_negative_zero(f)
+
+fn float_is_negative_zero(f) = f == 0.0 - 0.0 && 1.0 / f < 0.0
+
+// A digit list is a flat Mentl list of Int (values 0-9).
+//
+// Total over any index: past the list is the zero digit — this is what
+// makes float_digits_to_str's documented zero-padding TRUE (the raw
+// list_index here trapped the first time a SHORT digit list arrived; the
+// old seventeen-digit caller never exposed it).
+fn digit_at(digits, i) = if i < len(digits) { list_index(digits, i) } else { 0 }
+
+fn parse_int_digits(s, slen, i, acc) = if i >= slen {
+  acc
+} else {
+  let ch = byte_at(s, i)
+  if ch >= 48 && ch <= 57 { parse_int_digits(s, slen, i + 1, acc * 10 + (ch - 48)) } else { acc }
+}
+
+// digits and at most one '.' — the dot contributes nothing; any other
+// byte (the exponent marker included) ends the mantissa
+fn parse_mantissa_f64(s, slen, i, acc: Float) -> Float = if i >= slen {
+  acc
+} else {
+  let ch = byte_at(s, i)
+  if ch >= 48 && ch <= 57 {
+    parse_mantissa_f64(s, slen, i + 1, acc * 10.0 + float_of_int(ch - 48))
+  } else if ch == 46 {
+    parse_mantissa_f64(s, slen, i + 1, acc)
+  } else {
+    acc
+  }
+}
+
+fn count_mantissa_digits(s, slen, i) = if i >= slen {
+  0
+} else {
+  let ch = byte_at(s, i)
+  if ch >= 48 && ch <= 57 { 1 + count_mantissa_digits(s, slen, i + 1) } else { 0 }
+}
+
+// 10^k is exactly representable through k = 22 (5^22 < 2^53), so one
+// multiply or divide inside that range is one correctly-rounded step;
+// a wider exponent splits at the boundary and pays one extra rounding
+// only past every authored spelling
+fn float_scale10(m: Float, k) -> Float with Pure =
+  if k >= 0 { scale10_up(m, k) } else { scale10_down(m, 0 - k) }
+
+// m times ten to the k, for k not negative.
+fn scale10_up(m: Float, k) -> Float with Pure =
+  if k > 22 { scale10_up(m * float_pow10(22), k - 22) } else { m * float_pow10(k) }
+
+// m divided by ten to the k, for k not negative.
+fn scale10_down(m: Float, k) -> Float with Pure =
+  if k > 22 { scale10_down(m / float_pow10(22), k - 22) } else { m / float_pow10(k) }
+
+fn parse_int_sign(s, slen, i) = if i >= slen {
+  0
+} else {
+  let first = byte_at(s, i)
+  if first == 45 {
+    0 - parse_int_digits(s, slen, i + 1, 0)
+  } else if first == 43 {
+    parse_int_digits(s, slen, i + 1, 0)
+  } else {
+    parse_int_digits(s, slen, i, 0)
+  }
+}
+
+fn find_char(s, slen, start, ch) = if start >= slen {
+  -1
+} else if byte_at(s, start) == ch {
+  start
+} else {
+  find_char(s, slen, start + 1, ch)
+}
+
+fn find_char_either(s, slen, start, ch1, ch2) = if start >= slen {
+  -1
+} else {
+  let b = byte_at(s, start)
+  if b == ch1 || b == ch2 { start } else { find_char_either(s, slen, start + 1, ch1, ch2) }
+}
+
+// parse_float: convert a decimal string to a float.
+// Handles sign, integer part, fractional part, and optional 'e'/'E' exponent.
+// Returns 0.0 on empty or malformed input. Sits below its whole callee
+// family (callee-first in-file order): the DAG judgment is single-pass, so
+// a forward reference reads the loose pre-registered scheme and floors the
+// f64 mantissa to a word — measured as an assembly refusal in mentl run.
+fn parse_float(s) -> Float = {
+  let slen = byte_len(s)
+  if slen == 0 {
+    0.0
+  } else {
+    let first = byte_at(s, 0)
+    let start = if first == 45 { 1 } else { 0 }
+    let sign = if first == 45 { -1 } else { 1 }
+    let result = parse_float_body(s, slen, start)
+    float_of_int(sign) * result
+  }
+}
+
+fn parse_float_body(s, slen, i) -> Float = {
+  // The mantissa accumulates as ONE f64 integer — exact through 2^53,
+  // which covers every authored literal — and the decimal point only
+  // COUNTS digits, so the single scale by the exact power of ten is the
+  // one rounded operation: parse_float agrees with the assembler's
+  // correctly-rounded reader over the exact-mantissa range. A per-digit
+  // fraction division would pay one rounding per digit and split the
+  // two readers (the fmt idempotence failure that forced this form).
+  let mant = parse_mantissa_f64(s, slen, i, 0.0)
+  // '.'
+  let dot_pos = find_char(s, slen, i, 46)
+  let frac_len = if dot_pos < 0 { 0 } else { count_mantissa_digits(s, slen, dot_pos + 1) }
+  // 'e' or 'E'
+  let e_pos = find_char_either(s, slen, i, 101, 69)
+  let exp = if e_pos < 0 { 0 } else { parse_int_sign(s, slen, e_pos + 1) }
+  float_scale10(mant, exp - frac_len)
+}
+
+// String sets — sorted flat arrays + binary search.
+// The compiler operates on string-keyed sets in many places: effect
+// names, record fields, declared rows, capability lists, ownership
+// names. Every set is a flat (tag=0) list of unique strings in
+// lexicographic ascending order. Set operations preserve that
+// invariant and produce O(N+M) merges, O(log N) membership.
+//
+// set_contains — O(log N) binary search over a sorted set.
+fn set_contains(set, target) = set_bsearch(set, target, 0, len(set))
+
+fn set_bsearch(set, target, lo, hi) = if lo >= hi {
+  false
+} else {
+  let mid = (lo + hi) / 2
+  let pivot = list_index(set, mid)
+  if str_eq(pivot, target) {
+    true
+  } else if str_lt(pivot, target) {
+    set_bsearch(set, target, mid + 1, hi)
+  } else {
+    set_bsearch(set, target, lo, mid)
+  }
+}
+
+// set_union: merge two sorted sets into a fresh sorted, deduped set.
+// O(M + N) — single-pass two-pointer merge into a pre-sized buffer.
+fn set_union(a, b) = {
+  let len_a = len(a)
+  let len_b = len(b)
+  let buf = make_list(len_a + len_b)
+  let final_len = set_union_merge(a, b, buf, 0, 0, 0, len_a, len_b)
+  set_trim(buf, final_len)
+}
+
+fn set_union_merge(a, b, buf, ai, bi, oi, len_a, len_b) = if ai >= len_a {
+  if bi >= len_b {
+    oi
+  } else {
+    set_union_merge(a, b, list_set(buf, oi, list_index(b, bi)), ai, bi + 1, oi + 1, len_a, len_b)
+  }
+} else if bi >= len_b {
+  set_union_merge(a, b, list_set(buf, oi, list_index(a, ai)), ai + 1, bi, oi + 1, len_a, len_b)
+} else {
+  let xa = list_index(a, ai)
+  let xb = list_index(b, bi)
+  if str_eq(xa, xb) {
+    set_union_merge(a, b, list_set(buf, oi, xa), ai + 1, bi + 1, oi + 1, len_a, len_b)
+  } else if str_lt(xa, xb) {
+    set_union_merge(a, b, list_set(buf, oi, xa), ai + 1, bi, oi + 1, len_a, len_b)
+  } else {
+    set_union_merge(a, b, list_set(buf, oi, xb), ai, bi + 1, oi + 1, len_a, len_b)
+  }
+}
+
+// set_diff: a minus b. Both sorted; output sorted. O(M + N).
+fn set_diff(a, b) = {
+  let len_a = len(a)
+  let len_b = len(b)
+  let buf = make_list(len_a)
+  let final_len = set_diff_merge(a, b, buf, 0, 0, 0, len_a, len_b)
+  set_trim(buf, final_len)
+}
+
+fn set_diff_merge(a, b, buf, ai, bi, oi, len_a, len_b) = if ai >= len_a {
+  oi
+} else if bi >= len_b {
+  set_diff_merge(a, b, list_set(buf, oi, list_index(a, ai)), ai + 1, bi, oi + 1, len_a, len_b)
+} else {
+  let xa = list_index(a, ai)
+  let xb = list_index(b, bi)
+  if str_eq(xa, xb) {
+    set_diff_merge(a, b, buf, ai + 1, bi + 1, oi, len_a, len_b)
+  } else if str_lt(xa, xb) {
+    set_diff_merge(a, b, list_set(buf, oi, xa), ai + 1, bi, oi + 1, len_a, len_b)
+  } else {
+    set_diff_merge(a, b, buf, ai, bi + 1, oi, len_a, len_b)
+  }
+}
+
+// set_eq: structural equality of two sorted sets. O(N).
+fn set_eq(a, b) = {
+  let la = len(a)
+  let lb = len(b)
+  if la != lb { false } else { set_eq_loop(a, b, 0, la) }
+}
+
+fn set_eq_loop(a, b, i, n) = if i >= n {
+  true
+} else if str_eq(list_index(a, i), list_index(b, i)) {
+  set_eq_loop(a, b, i + 1, n)
+} else {
+  false
+}
+
+// set_canonicalize: convert any string list (possibly unsorted, may
+// have duplicates) into a sorted, deduped flat set. Boundary
+// normalization for consumers that receive raw input from parser /
+// AST. Hot-path callers should already maintain the invariant and
+// skip this step.
+fn set_canonicalize(lst) = {
+  let n = len(lst)
+  set_canonicalize_loop(lst, [], 0, n)
+}
+
+fn set_canonicalize_loop(lst, acc, i, n) =
+  if i >= n { acc } else { set_canonicalize_loop(lst, set_insert(acc, list_index(lst, i)), i + 1, n) }
+
+// set_insert: insert into sorted set, maintaining order and dedup.
+// O(N) due to position scan + copy; hot-path callers should prefer
+// set_union with a singleton set when inserting into large sets.
+fn set_insert(set, name) = {
+  let n = len(set)
+  let pos = set_find_pos(set, name, 0, n)
+  // The guard written as the nested if it means: the read past the end runs
+  // only where the position is inside the set.
+  let present = if pos < n { str_eq(list_index(set, pos), name) } else { false }
+  if present { set } else { set_insert_at(set, name, pos, n) }
+}
+
+fn set_find_pos(set, name, i, n) = if i >= n {
+  n
+} else if str_lt(list_index(set, i), name) {
+  set_find_pos(set, name, i + 1, n)
+} else {
+  i
+}
+
+fn set_insert_at(set, name, pos, n) = {
+  let buf = make_list(n + 1)
+  let buf_with_prefix = list_copy_into(set, buf, 0, pos)
+  let buf_with_ins = list_set(buf_with_prefix, pos, name)
+  copy_suffix_shifted(set, buf_with_ins, pos, pos, n)
+}
+
+// Copy src[src_idx..n) into dst[src_idx+1..n+1) — shift suffix by 1.
+fn copy_suffix_shifted(src, dst, src_idx, dst_idx, n) = if src_idx >= n {
+  dst
+} else {
+  copy_suffix_shifted(
+    src,
+    list_set(dst, dst_idx + 1, list_index(src, src_idx)),
+    src_idx + 1,
+    dst_idx + 1,
+    n
+  )
+}
+
+fn set_trim(buf, n) = {
+  let trimmed = make_list(n)
+  list_copy_into(buf, trimmed, 0, n)
+}
+
+// set_intersect: a ∩ b. Both sorted; output sorted, <= min(|a|,|b|). // drift-audit: ignore
+fn set_intersect(a, b) = {
+  let len_a = len(a)
+  let len_b = len(b)
+  let cap = if len_a < len_b { len_a } else { len_b }
+  let buf = make_list(cap)
+  let final_len = set_intersect_merge(a, b, buf, 0, 0, 0, len_a, len_b)
+  set_trim(buf, final_len)
+}
+
+fn set_intersect_merge(a, b, buf, ai, bi, oi, len_a, len_b) = if ai >= len_a || bi >= len_b {
+  oi
+} else {
+  let xa = list_index(a, ai)
+  let xb = list_index(b, bi)
+  if str_eq(xa, xb) {
+    set_intersect_merge(a, b, list_set(buf, oi, xa), ai + 1, bi + 1, oi + 1, len_a, len_b)
+  } else if str_lt(xa, xb) {
+    set_intersect_merge(a, b, buf, ai + 1, bi, oi, len_a, len_b)
+  } else {
+    set_intersect_merge(a, b, buf, ai, bi + 1, oi, len_a, len_b)
+  }
+}
+
+// set_subset: every element of `sub` appears in `sup`. O(|sub| * log|sup|). // drift-audit: ignore
+fn set_subset(sub, sup) = set_subset_loop(sub, sup, 0, len(sub))
+
+fn set_subset_loop(sub, sup, i, n) = if i >= n {
+  true
+} else if set_contains(sup, list_index(sub, i)) {
+  set_subset_loop(sub, sup, i + 1, n)
+} else {
+  false
+}
+
+// set_disjoint: no element of `a` appears in `b`. O(|a| * log|b|). // drift-audit: ignore
+fn set_disjoint(a, b) = set_disjoint_loop(a, b, 0, len(a))
+
+fn set_disjoint_loop(a, b, i, n) = if i >= n {
+  true
+} else if set_contains(b, list_index(a, i)) {
+  false
+} else {
+  set_disjoint_loop(a, b, i + 1, n)
+}
+
+// strip_underscores — remove all underscore (95) bytes from a string.
+// Used by lex_from to normalize 1_000_000 → "1000000" before parsing.
+// Buffer-counter substrate: list_extend_to + list_set + counter + slice.
+fn strip_underscores(ref s) = {
+  let n = byte_len(s)
+  let buf = make_list(n)
+  let final_count = strip_underscores_loop(s, 0, n, buf, 0)
+  str_slice_from_list(buf, final_count)
+}
+
+fn strip_underscores_loop(ref s, i, n, own buf, count) = if i >= n {
+  count
+} else {
+  let b = byte_at(s, i)
+  if b == 95 {
+    strip_underscores_loop(s, i + 1, n, buf, count)
+  } else {
+    let extended = list_extend_to(buf, count + 1)
+    let written = list_set(extended, count, b)
+    strip_underscores_loop(s, i + 1, n, written, count + 1)
+  }
+}
+
+// str_slice_from_list: materialise the first `n` bytes of a byte-list
+// into a fresh flat string. Used only by strip_underscores above.
+fn str_slice_from_list(ref lst, n) = {
+  let dest = bytes_buf(n)
+  str_slice_from_list_loop(lst, dest, 0, n)
+  str_of_buf(dest)
+}
+
+fn str_slice_from_list_loop(ref lst, dest, i, n) = if i >= n {
+  ()
+} else {
+  store_i8(addr_at(dest, 8 + i), list_index(lst, i))
+  str_slice_from_list_loop(lst, dest, i + 1, n)
+}
+
+// parse_int_base and parse_int_base_loop lived here, taking a base as an
+// Int in {2, 8, 10, 16} and re-deriving from three hand-written byte
+// ranges what the lexer's scanner had already proved. Where the two
+// classifiers disagreed the loop answered 0 — the fabrication its own
+// comment named and deferred to a refinement that never came. The value
+// now accumulates in the single scan that proves it (src/lexer.mn,
+// base_digit over the NumBase ADT), so there is no second walk to correct
+// and no string to refine.
+

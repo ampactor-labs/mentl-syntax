@@ -1,0 +1,76 @@
+{
+  "name": "mentl-syntax",
+  "displayName": "Mentl Language Support",
+  "description": "TextMate grammar, language configuration, and themes for Mentl .mn files.",
+  "version": "0.1.0",
+  "publisher": "ampactor-labs",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ampactor-labs/mentl-syntax.git"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": ["Programming Languages", "Themes"],
+  "keywords": ["mentl", "language", "syntax", "theme"],
+  "files": [
+    "LICENSE",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "README.md",
+    "docs/token-comparison.md",
+    "fixtures/README.md",
+    "language-configuration.json",
+    "mentl.tmLanguage.json",
+    "themes/*.json"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "mentl",
+        "aliases": ["Mentl", "mentl"],
+        "extensions": [".mn"],
+        "mimetypes": ["text/vnd.ampactor.mentl"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "mentl",
+        "scopeName": "source.mentl",
+        "path": "./mentl.tmLanguage.json"
+      }
+    ],
+    "themes": [
+      {
+        "label": "Mentl Obsidian",
+        "uiTheme": "vs-dark",
+        "path": "./themes/obsidian-color-theme.json"
+      },
+      {
+        "label": "Mentl Parchment",
+        "uiTheme": "vs",
+        "path": "./themes/parchment-color-theme.json"
+      }
+    ],
+    "configurationDefaults": {
+      "[mentl]": {
+        "editor.tabSize": 2,
+        "editor.insertSpaces": true
+      }
+    }
+  },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build:fixtures": "vite build",
+    "verify:grammar": "node scripts/verify-grammar.mjs",
+    "verify:vscode": "node scripts/verify-vscode-install.mjs",
+    "package:vsix": "node scripts/package-vsix.mjs"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.3.2",
+    "shiki": "^4.5.0",
+    "vite": "^7.1.9"
+  }
+}

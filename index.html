@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mentl grammar fixture</title>
+  </head>
+  <body>
+    <main>
+      <header>
+        <p class="eyebrow">TextMate grammar preview</p>
+        <h1>Mentl syntax fixture</h1>
+        <p class="fixture-name">fixtures/examples/grid/station.mn</p>
+      </header>
+      <section class="previews" aria-label="Same Mentl fixture in both themes">
+        <article>
+          <h2>Obsidian</h2>
+          <div id="obsidian" aria-live="polite"></div>
+        </article>
+        <article>
+          <h2>Parchment</h2>
+          <div id="parchment" aria-live="polite"></div>
+        </article>
+      </section>
+      <p id="status" role="status">Loading the TextMate grammar…</p>
+    </main>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

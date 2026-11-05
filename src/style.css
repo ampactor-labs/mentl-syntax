@@ -1,0 +1,50 @@
+:root {
+  color-scheme: light;
+  font-family: Inter, system-ui, sans-serif;
+  background: #ede2d0;
+  color: #1a1618;
+}
+
+body {
+  margin: 0;
+  padding: 32px;
+}
+
+main {
+  max-width: 1500px;
+  margin: 0 auto;
+}
+
+header { margin-bottom: 24px; }
+.eyebrow { color: #6e655d; text-transform: uppercase; letter-spacing: .09em; font-size: .75rem; }
+h1 { margin: 0 0 8px; font-size: 1.8rem; }
+.fixture-name { color: #5b534d; font-family: ui-monospace, monospace; }
+
+.previews {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 620px), 1fr));
+  gap: 18px;
+  align-items: start;
+}
+
+article { min-width: 0; }
+h2 { font-size: .95rem; margin: 0 0 8px; }
+
+.shiki {
+  border-radius: 8px;
+  padding: 18px;
+  margin: 0;
+  overflow: auto;
+  max-height: 78vh;
+  font: 12px/1.65 "JetBrains Mono", ui-monospace, monospace;
+  font-variant-ligatures: none;
+  tab-size: 2;
+}
+
+#status { color: #5b534d; font-size: .85rem; }
+#status.error { color: #a04500; }
+
+@media (max-width: 700px) {
+  body { padding: 16px; }
+  .shiki { font-size: 11px; }
+}

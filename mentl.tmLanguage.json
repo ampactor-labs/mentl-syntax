@@ -1,0 +1,208 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Mentl",
+  "scopeName": "source.mentl",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#declarations" },
+    { "include": "#discipline" },
+    { "include": "#keywords" },
+    { "include": "#verbs" },
+    { "include": "#holes" },
+    { "include": "#numbers" },
+    { "include": "#negation" },
+    { "include": "#self" },
+    { "include": "#types" },
+    { "include": "#braces" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.mentl",
+          "begin": "//",
+          "end": "$",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.comment.begin.mentl" }
+          }
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.multi.mentl",
+          "begin": "\"\"\"",
+          "end": "\"\"\"",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.string.begin.mentl" }
+          },
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.mentl" }
+          },
+          "patterns": [
+            { "include": "#interpolation" },
+            { "include": "#string-escapes" }
+          ]
+        },
+        {
+          "name": "string.quoted.double.mentl",
+          "begin": "\"",
+          "end": "\"|$",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.string.begin.mentl" }
+          },
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.mentl" }
+          },
+          "patterns": [
+            { "include": "#interpolation" },
+            { "include": "#string-escapes" }
+          ]
+        }
+      ]
+    },
+    "string-escapes": {
+      "patterns": [
+        {
+          "name": "constant.character.escape.mentl",
+          "match": "\\\\(?:x[0-9A-Fa-f]{2}|.)"
+        }
+      ]
+    },
+    "interpolation": {
+      "name": "meta.embedded.expression.mentl",
+      "begin": "\\{(?=[A-Za-z0-9_!(]|\\[)",
+      "end": "\\}",
+      "beginCaptures": {
+        "0": { "name": "punctuation.section.embedded.begin.mentl" }
+      },
+      "endCaptures": {
+        "0": { "name": "punctuation.section.embedded.end.mentl" }
+      },
+      "patterns": [
+        { "include": "#braces" },
+        { "include": "$self" }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(fn|type|effect|handler)([ \\t\\r]+)([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.declaration.mentl" },
+            "3": { "name": "entity.name.function.mentl" }
+          }
+        }
+      ]
+    },
+    "discipline": {
+      "patterns": [
+        {
+          "name": "keyword.other.discipline.mentl",
+          "match": "\\b(?:own|ref|Pure|resume)\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.mentl",
+          "match": "\\b(?:fn|let|if|else|match|type|effect|handler|with|import|where|true|false)\\b"
+        }
+      ]
+    },
+    "verbs": {
+      "patterns": [
+        {
+          "name": "keyword.operator.pipe.mentl",
+          "match": "(?:\\|>|<\\||><|~>|<~)"
+        }
+      ]
+    },
+    "holes": {
+      "patterns": [
+        {
+          "name": "keyword.operator.hole.mentl",
+          "match": "\\?\\?"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.mentl",
+          "match": "(?<![A-Za-z0-9_])0x[0-9A-Fa-f_]*"
+        },
+        {
+          "name": "constant.numeric.mentl",
+          "match": "(?<![A-Za-z0-9_])0b[01_]*"
+        },
+        {
+          "name": "constant.numeric.mentl",
+          "match": "(?<![A-Za-z0-9_])0o[0-7_]*"
+        },
+        {
+          "name": "constant.numeric.mentl",
+          "match": "(?<![A-Za-z0-9_])[0-9][0-9_]*(?:\\.[0-9][0-9_]*)?"
+        }
+      ]
+    },
+    "negation": {
+      "patterns": [
+        {
+          "name": "keyword.operator.negation.mentl",
+          "match": "!(?=[ \\t\\r]*Pure\\b)"
+        },
+        {
+          "name": "keyword.operator.negation.mentl",
+          "match": "![ \\t\\r]*(?!Pure\\b)[A-Z][A-Za-z0-9_]*"
+        }
+      ]
+    },
+    "self": {
+      "patterns": [
+        {
+          "name": "variable.language.self.mentl",
+          "match": "\\bself\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "entity.name.type.mentl",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "braces": {
+      "patterns": [
+        {
+          "name": "meta.block.mentl",
+          "begin": "\\{",
+          "end": "\\}",
+          "beginCaptures": {
+            "0": { "name": "punctuation.section.block.begin.mentl" }
+          },
+          "endCaptures": {
+            "0": { "name": "punctuation.section.block.end.mentl" }
+          },
+          "patterns": [
+            { "include": "$self" }
+          ]
+        }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "keyword.operator.mentl",
+          "match": "(?:==|!=|<=|>=|->|=>|\\+\\+|&&|\\|\\||[+*/%=&<>:.,;()\\[\\]@|!-])"
+        }
+      ]
+    }
+  }
+}

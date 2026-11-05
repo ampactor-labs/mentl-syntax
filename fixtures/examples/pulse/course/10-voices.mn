@@ -1,0 +1,91 @@
+// 10 · voices: the whole piece, each voice on its own core
+//
+// Four voices, a chord of A minor over four seconds, each voice rendered
+// whole by one branch of a fanout and the branches run on threads.
+//
+//   mentl run examples/pulse/course/10-voices.mn > 10.wav
+//
+// `fanout(render_voice(sr), notes)` is `><` over a sequence: each element is
+// an independent branch, and the results are collected in order. The
+// operator only describes the shape. `~> parallel_compose` at the end of the
+// chain runs the branches on host threads, and `sequential_compose` in its
+// place changes nothing in the voices. A voice is a closure with memory (its
+// phase line, its filter's line) created inside its branch, so no two
+// branches share a byte. The medium's race rule makes the schedule safe to
+// install: a branch that reached a stateful handler at the root, or a line
+// another branch ticks, fails with E_ThreadedBranchEffect naming the store.
+//
+//   mentl where examples/pulse/course/10-voices.mn render    fanout [Thread, a branch per element]
+//
+// The race rule checks a write by the age of the memory it writes. A voice's
+// tick writes the record that owns its line, and the voice's claim records
+// this. The frame holding the voice counts that record as its own age, and
+// the branch created it, so the write builds a value and the branches run.
+// The mix never reads a frame by index: the four voices are zipped frame by
+// frame and written into the file, so the lesson has no unproven claims.
+import audio/wav
+
+import dsp/clock
+
+import dsp/envelope
+
+import dsp/feedback
+
+import dsp/osc
+
+import dsp/signal
+
+import dsp/stereo
+
+import io
+
+import rate
+
+import threading
+
+fn seconds() with Pure = 4
+
+// The chord: A3, C4, E4, A4, each voice placed from left to right.
+fn notes() = [220.0, 261.63, 329.63, 440.0]
+
+fn place(v) with Pure = -0.6 + 0.4 * float_of_int(v)
+
+// One whole voice: its oscillator and its filter are created here, in the
+// branch that renders it, and the list of its samples is the branch's result.
+fn render_voice(sr, frames, hz) = {
+  let voice = saw_voice(sr)
+  let tone = lowpass_filter(sr)
+  fn sample(i) with !Alloc = {
+    let t = float_of_int(i) / float_of_int(sr)
+    voice(hz) * adsr(0.02, 0.4, 0.5, 1.0, 4.0, t) |> tone(1200.0)
+  }
+  range(0, frames) |> map(sample)
+}
+
+fn render(sr, frames) = notes() >< render_voice(sr, frames) ~> parallel_compose
+
+// The mix: each voice at its place, as a stereo pair per frame.
+fn placed(v, samples) =
+  map({ s => (0.3 * s * pan_left(place(v)), 0.3 * s * pan_right(place(v))) }, samples)
+
+fn add_pair(a, b) = match (a, b) {
+  ((l1, r1), (l2, r2)) => (l1 + l2, r1 + r2),
+}
+
+// The four voices summed frame by frame: zipped, never read by index.
+fn chord(voices) =
+  voices |> enumerate |> map({ (v, samples) => placed(v, samples) }) |> reduce(??, zip_with(add_pair, ??, ??))
+
+// Each pair soft-clipped into the file at its frame.
+fn write_frames(buf, mixed) =
+  mixed |> enumerate |> each({ (n, (l, r)) => wav_frame(buf, n, soft_clip(l), soft_clip(r)) })
+
+fn main() = {
+  {
+    let frames = frames_of(seconds())
+    let buf = wav_header(wav_alloc(frames), frames, rate())
+    write_frames(buf, chord(render(rate(), frames)))
+    print(wav_bytes(buf))
+  } ~> stdout_console ~> sample_at(48000)
+  0
+}

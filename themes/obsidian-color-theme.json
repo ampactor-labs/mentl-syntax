@@ -1,0 +1,57 @@
+{
+  "$schema": "vscode://schemas/color-theme",
+  "name": "Mentl Obsidian",
+  "type": "dark",
+  "colors": {
+    "editor.background": "#0D0B0E",
+    "editor.foreground": "#E8DCC8",
+    "editorCursor.foreground": "#F0B830",
+    "editor.selectionBackground": "#E69F0038"
+  },
+  "tokenColors": [
+    {
+      "scope": ["comment.line.double-slash.mentl"],
+      "settings": { "foreground": "#8E8378", "fontStyle": "italic" }
+    },
+    {
+      "scope": ["keyword.declaration.mentl", "keyword.control.mentl"],
+      "settings": { "foreground": "#5FB0DC" }
+    },
+    {
+      "scope": ["keyword.other.discipline.mentl"],
+      "settings": { "foreground": "#D9A0C0" }
+    },
+    {
+      "scope": ["keyword.operator.pipe.mentl"],
+      "settings": { "foreground": "#7CC8EE", "fontStyle": "bold" }
+    },
+    {
+      "scope": ["entity.name.type.mentl"],
+      "settings": { "foreground": "#F0B830" }
+    },
+    {
+      "scope": ["entity.name.function.mentl"],
+      "settings": { "foreground": "#33B893" }
+    },
+    {
+      "scope": ["constant.numeric.mentl", "keyword.operator.hole.mentl", "keyword.operator.negation.mentl"],
+      "settings": { "foreground": "#E87D44" }
+    },
+    {
+      "scope": ["string.quoted.double.mentl", "string.quoted.multi.mentl"],
+      "settings": { "foreground": "#F0C674" }
+    },
+    {
+      "scope": ["punctuation.section.embedded.begin.mentl"],
+      "settings": { "foreground": "#F5EDE0" }
+    },
+    {
+      "scope": ["punctuation.section.embedded.end.mentl"],
+      "settings": { "foreground": "#E8DCC8" }
+    },
+    {
+      "scope": ["variable.language.self.mentl"],
+      "settings": { "foreground": "#E87D44", "fontStyle": "italic" }
+    }
+  ]
+}
